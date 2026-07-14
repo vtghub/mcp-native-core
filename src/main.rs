@@ -6,10 +6,6 @@ use tokio::io::{stdin, stdout, BufReader, BufWriter, AsyncBufReadExt, AsyncWrite
 use serde::{Deserialize, Serialize};
 use regex::Regex;
 
-// =========================================================================
-// 1. PROTOCOL DEFINITIONS (JSON-RPC 2.0 / MCP Compliance)
-// =========================================================================
-
 #[derive(Deserialize, Serialize, Debug)]
 struct JsonRpcRequest {
     jsonrpc: String,
@@ -50,10 +46,6 @@ impl McpServerState {
         self.tools.insert(tool.name().to_string(), Arc::from(tool));
     }
 }
-
-// =========================================================================
-// 2. TOOL 1: ULTRA-FAST MEMORY-MAPPED REGEX CODE SEARCH ENGINE
-// =========================================================================
 
 pub struct FastSearchTool;
 impl FastSearchTool {
@@ -163,10 +155,6 @@ impl McpTool for FastSearchTool {
     }
 }
 
-// =========================================================================
-// 3. TOOL 2: LIGHTWEIGHT STRUCTURAL AST-LITE PARSER
-// =========================================================================
-
 pub struct ParseStructureTool;
 impl ParseStructureTool {
     pub fn new() -> Self { Self }
@@ -198,11 +186,6 @@ impl McpTool for ParseStructureTool {
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| format!("Mmap failed: {}", e))? };
         let content = std::str::from_utf8(&mmap).map_err(|e| format!("Invalid UTF-8 sequence: {}", e))?;
 
-        // Context-aware regex signatures for structure mapping
-        let rust_pattern = Regex::new(r"^\s*(pub\s+)?(async\s+)?(fn|struct|enum|trait|impl)\s+([a-zA-Z0-9_<>]+)").unwrap();
-        let python_pattern = Regex::new(r"^\s*(def|class)\s+([a-zA-Z0-9_]+)").unwrap();
-        let csharp_pattern = Regex::new(r"^\s*(public|private|protected|internal\s+)?(class|struct|interface|enum|void|[a-zA-Z0-9_<>]+)\s+([a-zA-Z0-9_<>]+)\s*\(").unwrap();
-
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let mut structural_nodes = Vec::new();
 
@@ -212,14 +195,7 @@ impl McpTool for ParseStructureTool {
                 continue;
             }
 
-            let matches = match ext {
-                "rs" => rust_pattern.is_match(line),
-                "py" => python_pattern.is_match(line),
-                "cs" => csharp_pattern.is_match(line),
-                _ => false,
-            };
-
-            if matches {
+            if mcp_native_core::matches_structural_line(ext, line) {
                 structural_nodes.push(serde_json::json!({
                     "line": idx + 1,
                     "declaration": line_trimmed
@@ -235,10 +211,6 @@ impl McpTool for ParseStructureTool {
         }))
     }
 }
-
-// =========================================================================
-// 4. SERVER TRANSPORT ENGINE (ASYNCHRONOUS PROTOCOL ROUTER)
-// =========================================================================
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -281,7 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if req.id.is_none() { return; }
 
                 let response = match req.method.as_str() {
-                    "initialize" => handle_initialize(req.id), // <-- THE CRITICAL HANDSHAKE
+                    "initialize" => handle_initialize(req.id),
                     "tools/list" => handle_list_tools(&state_clone, req.id),
                     "tools/call" => handle_call_tool(&state_clone, req.params, req.id).await,
                     _ => handle_unknown_method(req.id),
