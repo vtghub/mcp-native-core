@@ -168,6 +168,55 @@ impl FileCache {
     }
 }
 
+struct CachedContentEntry {
+    mtime: SystemTime,
+    len: u64,
+    content: Arc<str>,
+}
+
+/// Caches whole-file text content, keyed by absolute path, so a repeat
+/// `fast_search` query over an unchanged file skips re-opening, re-mmapping,
+/// and re-decoding it — only the regex scan itself needs to rerun, since the
+/// query differs per call. Freshness follows the same (mtime, len) contract
+/// as `FileCache`.
+///
+/// Unlike `FileCache`/`DirCache`, an entry here is never evicted just for
+/// staying correct: a file searched once and never touched again stays
+/// cached — its content copied into the heap rather than just mmap-backed —
+/// for the life of the process. For a long-running server pointed at very
+/// large or many-file repos that's an unbounded memory trade-off worth
+/// revisiting (an LRU cap, or size-based eviction) if it becomes a problem
+/// in practice; out of scope for now.
+pub struct ContentCache {
+    entries: DashMap<PathBuf, CachedContentEntry>,
+}
+
+impl ContentCache {
+    pub fn new() -> Self {
+        Self { entries: DashMap::new() }
+    }
+
+    pub fn get_if_fresh(&self, path: &Path, mtime: SystemTime, len: u64) -> Option<Arc<str>> {
+        self.entries.get(path).and_then(|entry| {
+            if entry.mtime == mtime && entry.len == len {
+                Some(entry.content.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn store(&self, path: PathBuf, mtime: SystemTime, len: u64, content: Arc<str>) {
+        self.entries.insert(path, CachedContentEntry { mtime, len, content });
+    }
+
+    /// Evict a file's cached content, e.g. in response to a filesystem watch
+    /// event. Safe to call for a path with no entry.
+    pub fn invalidate(&self, path: &Path) {
+        self.entries.remove(path);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,5 +338,49 @@ mod tests {
 
         let stale = cache.get_if_fresh(&file_path, new_meta.modified().unwrap(), new_meta.len());
         assert!(stale.is_none(), "changed file should invalidate cache");
+    }
+
+    #[test]
+    fn content_cache_serves_fresh_entry_and_rejects_stale() {
+        let dir = TempDir::new();
+        let file_path = dir.path().join("a.rs");
+        fs::write(&file_path, "fn a() {}").unwrap();
+
+        let meta = fs::metadata(&file_path).unwrap();
+        let mtime = meta.modified().unwrap();
+        let len = meta.len();
+
+        let cache = ContentCache::new();
+        assert!(cache.get_if_fresh(&file_path, mtime, len).is_none());
+
+        let content: Arc<str> = Arc::from("fn a() {}");
+        cache.store(file_path.clone(), mtime, len, content.clone());
+
+        let hit = cache.get_if_fresh(&file_path, mtime, len);
+        assert!(hit.is_some());
+        assert_eq!(&*hit.unwrap(), "fn a() {}");
+
+        settle();
+        fs::write(&file_path, "fn a() {}\nfn b() {}").unwrap();
+        let new_meta = fs::metadata(&file_path).unwrap();
+
+        let stale = cache.get_if_fresh(&file_path, new_meta.modified().unwrap(), new_meta.len());
+        assert!(stale.is_none(), "changed file should invalidate cache");
+    }
+
+    #[test]
+    fn content_cache_invalidate_removes_entry_regardless_of_freshness_check() {
+        let dir = TempDir::new();
+        let file_path = dir.path().join("a.rs");
+        fs::write(&file_path, "fn a() {}").unwrap();
+        let meta = fs::metadata(&file_path).unwrap();
+        let (mtime, len) = (meta.modified().unwrap(), meta.len());
+
+        let cache = ContentCache::new();
+        cache.store(file_path.clone(), mtime, len, Arc::from("fn a() {}"));
+        assert!(cache.get_if_fresh(&file_path, mtime, len).is_some());
+
+        cache.invalidate(&file_path);
+        assert!(cache.get_if_fresh(&file_path, mtime, len).is_none());
     }
 }
