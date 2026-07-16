@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -8,7 +9,7 @@ use regex::Regex;
 
 mod cache;
 mod watcher;
-use cache::{DirCache, FileCache};
+use cache::{ContentCache, DirCache, FileCache};
 use watcher::RepoWatcher;
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -54,10 +55,13 @@ impl McpServerState {
 
 pub struct FastSearchTool {
     dir_cache: Arc<DirCache>,
+    content_cache: Arc<ContentCache>,
     watcher: Arc<RepoWatcher>,
 }
 impl FastSearchTool {
-    pub fn new(dir_cache: Arc<DirCache>, watcher: Arc<RepoWatcher>) -> Self { Self { dir_cache, watcher } }
+    pub fn new(dir_cache: Arc<DirCache>, content_cache: Arc<ContentCache>, watcher: Arc<RepoWatcher>) -> Self {
+        Self { dir_cache, content_cache, watcher }
+    }
 }
 
 #[async_trait::async_trait]
@@ -101,15 +105,44 @@ impl McpTool for FastSearchTool {
         let start_time = std::time::Instant::now();
         let regex = Arc::new(regex);
         let mut tasks = Vec::new();
+        let content_hits = Arc::new(AtomicUsize::new(0));
+        let content_misses = Arc::new(AtomicUsize::new(0));
 
         for file_path in target_files {
             let pattern = Arc::clone(&regex);
-            
+            let content_cache = Arc::clone(&self.content_cache);
+            let content_hits = Arc::clone(&content_hits);
+            let content_misses = Arc::clone(&content_misses);
+
             let task = tokio::task::spawn_blocking(move || -> Option<serde_json::Value> {
-                let file = File::open(&file_path).ok()?;
-                let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
-                let content = std::str::from_utf8(&mmap).ok()?;
-                
+                // Stat first (cheap) so an unchanged file can skip the
+                // open+mmap+utf8-decode below entirely on a cache hit —
+                // only the regex scan has to rerun, since the query differs
+                // per call. Falls straight through to a full read on a stat
+                // failure (e.g. a race with a delete) or a cache miss.
+                let content: Arc<str> = 'content: {
+                    if let Ok(metadata) = std::fs::metadata(&file_path) {
+                        if let Ok(mtime) = metadata.modified() {
+                            let len = metadata.len();
+                            if let Some(cached) = content_cache.get_if_fresh(&file_path, mtime, len) {
+                                content_hits.fetch_add(1, Ordering::Relaxed);
+                                break 'content cached;
+                            }
+                            content_misses.fetch_add(1, Ordering::Relaxed);
+                            let file = File::open(&file_path).ok()?;
+                            let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+                            let text = std::str::from_utf8(&mmap).ok()?;
+                            let owned: Arc<str> = Arc::from(text);
+                            content_cache.store(file_path.clone(), mtime, len, owned.clone());
+                            break 'content owned;
+                        }
+                    }
+                    content_misses.fetch_add(1, Ordering::Relaxed);
+                    let file = File::open(&file_path).ok()?;
+                    let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+                    Arc::from(std::str::from_utf8(&mmap).ok()?)
+                };
+
                 let mut line_matches = Vec::new();
                 for (idx, line) in content.lines().enumerate() {
                     if pattern.is_match(line) {
@@ -144,6 +177,8 @@ impl McpTool for FastSearchTool {
             "search_latency_ms": start_time.elapsed().as_millis(),
             "directories_scanned": crawl_stats.dirs_visited,
             "directories_rescanned": crawl_stats.dirs_rescanned,
+            "content_cache_hits": content_hits.load(Ordering::Relaxed),
+            "content_cache_misses": content_misses.load(Ordering::Relaxed),
             "matches": final_results
         }))
     }
@@ -237,9 +272,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir_cache = Arc::new(DirCache::new());
     let file_cache = Arc::new(FileCache::new());
-    let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone());
+    let content_cache = Arc::new(ContentCache::new());
+    let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache.clone());
 
-    state.register_tool(Box::new(FastSearchTool::new(dir_cache, watcher.clone())));
+    state.register_tool(Box::new(FastSearchTool::new(dir_cache, content_cache, watcher.clone())));
     state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher)));
 
     let shared_state = Arc::new(state);
