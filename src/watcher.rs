@@ -26,7 +26,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::cache::{DirCache, FileCache};
+use crate::cache::{ContentCache, DirCache, FileCache};
 
 const DEBOUNCE: Duration = Duration::from_millis(300);
 // Caps how many extra drain passes absorb events that arrive *while* a batch
@@ -42,9 +42,13 @@ pub struct RepoWatcher {
 
 impl RepoWatcher {
     /// Spawn the background drain task and return a handle tools can register
-    /// watch roots with. `dir_cache`/`file_cache` are the caches events get
-    /// applied to.
-    pub fn spawn(dir_cache: Arc<DirCache>, file_cache: Arc<FileCache>) -> Arc<Self> {
+    /// watch roots with. `dir_cache`/`file_cache`/`content_cache` are the
+    /// caches events get applied to.
+    pub fn spawn(
+        dir_cache: Arc<DirCache>,
+        file_cache: Arc<FileCache>,
+        content_cache: Arc<ContentCache>,
+    ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<PathBuf>();
 
         let event_tx = tx.clone();
@@ -66,7 +70,7 @@ impl RepoWatcher {
             watcher: Mutex::new(notify_watcher),
         });
 
-        tokio::spawn(drain_loop(rx, dir_cache, file_cache));
+        tokio::spawn(drain_loop(rx, dir_cache, file_cache, content_cache));
         this
     }
 
@@ -98,6 +102,7 @@ async fn drain_loop(
     mut rx: mpsc::UnboundedReceiver<PathBuf>,
     dir_cache: Arc<DirCache>,
     file_cache: Arc<FileCache>,
+    content_cache: Arc<ContentCache>,
 ) {
     loop {
         // Block until at least one event arrives.
@@ -115,7 +120,7 @@ async fn drain_loop(
             }
         }
 
-        apply_batch(&batch, &dir_cache, &file_cache);
+        apply_batch(&batch, &dir_cache, &file_cache, &content_cache);
 
         // Late-arrival drain: events that landed while we were applying the
         // batch above are already sitting in the channel (its buffering is
@@ -130,14 +135,15 @@ async fn drain_loop(
             if late.is_empty() {
                 break;
             }
-            apply_batch(&late, &dir_cache, &file_cache);
+            apply_batch(&late, &dir_cache, &file_cache, &content_cache);
         }
     }
 }
 
-fn apply_batch(paths: &[PathBuf], dir_cache: &DirCache, file_cache: &FileCache) {
+fn apply_batch(paths: &[PathBuf], dir_cache: &DirCache, file_cache: &FileCache, content_cache: &ContentCache) {
     for path in paths {
         file_cache.invalidate(path);
+        content_cache.invalidate(path);
         // A changed path invalidates its parent's directory listing (an
         // add/remove/rename changes the parent's mtime) and, if the changed
         // path is itself a directory, its own listing too.
@@ -196,7 +202,8 @@ mod tests {
 
         let dir_cache = Arc::new(DirCache::new());
         let file_cache = Arc::new(FileCache::new());
-        let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone());
+        let content_cache = Arc::new(ContentCache::new());
+        let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache.clone());
         watcher.ensure_watching(&dir.0);
 
         let nodes = Arc::new(vec![serde_json::json!({"line": 1, "declaration": "fn a() {}"})]);
@@ -220,13 +227,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watcher_evicts_content_cache_entry_on_modify() {
+        let dir = TempDir::new();
+        let file_path = dir.0.join("a.rs");
+        fs::write(&file_path, "fn a() {}").unwrap();
+        let meta = fs::metadata(&file_path).unwrap();
+        let (original_mtime, original_len) = (meta.modified().unwrap(), meta.len());
+
+        let dir_cache = Arc::new(DirCache::new());
+        let file_cache = Arc::new(FileCache::new());
+        let content_cache = Arc::new(ContentCache::new());
+        let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache.clone());
+        watcher.ensure_watching(&dir.0);
+
+        content_cache.store(file_path.clone(), original_mtime, original_len, Arc::from("fn a() {}"));
+        assert!(content_cache.get_if_fresh(&file_path, original_mtime, original_len).is_some());
+
+        sleep(StdDuration::from_millis(1100));
+        fs::write(&file_path, "fn a() {}\nfn b() {}").unwrap();
+
+        let evicted = wait_until(
+            || content_cache.get_if_fresh(&file_path, original_mtime, original_len).is_none(),
+            StdDuration::from_secs(3),
+        )
+        .await;
+        assert!(evicted, "watcher should have evicted the changed file's cached content");
+    }
+
+    #[tokio::test]
     async fn watcher_evicts_dir_cache_entry_on_new_file() {
         let dir = TempDir::new();
         fs::write(dir.0.join("a.rs"), "fn a() {}").unwrap();
 
         let dir_cache = Arc::new(DirCache::new());
         let file_cache = Arc::new(FileCache::new());
-        let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone());
+        let content_cache = Arc::new(ContentCache::new());
+        let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache);
         watcher.ensure_watching(&dir.0);
 
         let mut out = Vec::new();
@@ -255,7 +291,8 @@ mod tests {
 
         let dir_cache = Arc::new(DirCache::new());
         let file_cache = Arc::new(FileCache::new());
-        let watcher = RepoWatcher::spawn(dir_cache, file_cache);
+        let content_cache = Arc::new(ContentCache::new());
+        let watcher = RepoWatcher::spawn(dir_cache, file_cache, content_cache);
 
         watcher.ensure_watching(&dir.0);
         watcher.ensure_watching(&sub);
