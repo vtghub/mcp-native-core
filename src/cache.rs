@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -168,10 +169,33 @@ impl FileCache {
     }
 }
 
+// 256 MiB by default; override with MCP_CONTENT_CACHE_MAX_BYTES (parsed once
+// per ContentCache::new() call, so it can be set per-process).
+const DEFAULT_CONTENT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+// When a store() pushes the cache over budget, evict down to this fraction
+// of the cap rather than just enough to cross back under it — otherwise an
+// insert sitting right at the boundary would re-trigger a full eviction scan
+// on nearly every subsequent store().
+const EVICT_TARGET_RATIO: f64 = 0.9;
+
+fn env_max_bytes() -> usize {
+    std::env::var("MCP_CONTENT_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_CONTENT_CACHE_MAX_BYTES)
+}
+
 struct CachedContentEntry {
     mtime: SystemTime,
     len: u64,
     content: Arc<str>,
+    // Monotonic "clock" tick set on insert and bumped on every hit; used to
+    // approximate least-recently-used ordering without needing a real
+    // linked-list LRU (which would need a lock shared across every access,
+    // undermining DashMap's per-shard concurrency). A plain atomic field
+    // updatable through DashMap's shared read-guard is enough for this.
+    last_used: AtomicU64,
 }
 
 /// Caches whole-file text content, keyed by absolute path, so a repeat
@@ -180,25 +204,50 @@ struct CachedContentEntry {
 /// query differs per call. Freshness follows the same (mtime, len) contract
 /// as `FileCache`.
 ///
-/// Unlike `FileCache`/`DirCache`, an entry here is never evicted just for
-/// staying correct: a file searched once and never touched again stays
-/// cached — its content copied into the heap rather than just mmap-backed —
-/// for the life of the process. For a long-running server pointed at very
-/// large or many-file repos that's an unbounded memory trade-off worth
-/// revisiting (an LRU cap, or size-based eviction) if it becomes a problem
-/// in practice; out of scope for now.
+/// Bounded by a total byte budget (`max_bytes`, default 256 MiB, override via
+/// `MCP_CONTENT_CACHE_MAX_BYTES`): once `store()` pushes the running total
+/// over budget, the least-recently-used entries are evicted until back under
+/// `EVICT_TARGET_RATIO` of the cap. Eviction is approximate, not a strict
+/// global LRU: a snapshot-sort-evict pass runs concurrently with other
+/// threads' stores/evictions without a shared lock, so the byte total it
+/// evicts against can drift slightly during the pass. That's an acceptable
+/// trade-off for a cache this size (never unsafe, just approximate — the
+/// same trade-off production concurrent caches like Caffeine/moka make).
 pub struct ContentCache {
     entries: DashMap<PathBuf, CachedContentEntry>,
+    total_bytes: AtomicUsize,
+    max_bytes: usize,
+    clock: AtomicU64,
 }
 
 impl ContentCache {
     pub fn new() -> Self {
-        Self { entries: DashMap::new() }
+        Self::with_max_bytes(env_max_bytes())
+    }
+
+    /// Construct with an explicit byte budget instead of the environment
+    /// default — mainly for tests that need eviction to trigger
+    /// deterministically without allocating hundreds of megabytes.
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            entries: DashMap::new(),
+            total_bytes: AtomicUsize::new(0),
+            max_bytes,
+            clock: AtomicU64::new(0),
+        }
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
     pub fn get_if_fresh(&self, path: &Path, mtime: SystemTime, len: u64) -> Option<Arc<str>> {
+        let tick = self.tick();
         self.entries.get(path).and_then(|entry| {
             if entry.mtime == mtime && entry.len == len {
+                // Updating through the shared read-guard is safe: last_used
+                // is the only mutated field, and it's atomic.
+                entry.last_used.store(tick, Ordering::Relaxed);
                 Some(entry.content.clone())
             } else {
                 None
@@ -207,13 +256,59 @@ impl ContentCache {
     }
 
     pub fn store(&self, path: PathBuf, mtime: SystemTime, len: u64, content: Arc<str>) {
-        self.entries.insert(path, CachedContentEntry { mtime, len, content });
+        let new_size = content.len();
+        let entry = CachedContentEntry { mtime, len, content, last_used: AtomicU64::new(self.tick()) };
+        let old = self.entries.insert(path, entry);
+        let old_size = old.map(|e| e.content.len()).unwrap_or(0);
+        if new_size >= old_size {
+            self.total_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+        } else {
+            self.total_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+        }
+
+        if self.total_bytes.load(Ordering::Relaxed) > self.max_bytes {
+            self.evict_to_target();
+        }
+    }
+
+    /// Evict least-recently-used entries until the cache is back under
+    /// `EVICT_TARGET_RATIO * max_bytes`. Snapshots (path, last_used, size)
+    /// for every entry first — dropping all DashMap iterator guards — before
+    /// removing anything, so this can never hold a shard guard across a
+    /// `remove()` call on that same shard (the class of self-deadlock fixed
+    /// in DirCache during phase 1).
+    fn evict_to_target(&self) {
+        let target = (self.max_bytes as f64 * EVICT_TARGET_RATIO) as usize;
+
+        let mut snapshot: Vec<(PathBuf, u64, usize)> = self
+            .entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().last_used.load(Ordering::Relaxed), e.value().content.len()))
+            .collect();
+        snapshot.sort_unstable_by_key(|&(_, last_used, _)| last_used);
+
+        let mut current = self.total_bytes.load(Ordering::Relaxed);
+        let mut freed = 0usize;
+        for (path, _, size) in snapshot {
+            if current <= target {
+                break;
+            }
+            if self.entries.remove(&path).is_some() {
+                current = current.saturating_sub(size);
+                freed += size;
+            }
+        }
+        if freed > 0 {
+            self.total_bytes.fetch_sub(freed, Ordering::Relaxed);
+        }
     }
 
     /// Evict a file's cached content, e.g. in response to a filesystem watch
     /// event. Safe to call for a path with no entry.
     pub fn invalidate(&self, path: &Path) {
-        self.entries.remove(path);
+        if let Some((_, entry)) = self.entries.remove(path) {
+            self.total_bytes.fetch_sub(entry.content.len(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -382,5 +477,55 @@ mod tests {
 
         cache.invalidate(&file_path);
         assert!(cache.get_if_fresh(&file_path, mtime, len).is_none());
+    }
+
+    #[test]
+    fn content_cache_evicts_least_recently_used_when_over_budget() {
+        // 250-byte budget, evicting down to 90% (225) on overflow. Three
+        // 100-byte entries: after touching "a" via get_if_fresh, "b" becomes
+        // the least-recently-used entry, so storing "c" (pushing the total to
+        // 300, over budget) should evict exactly "b".
+        let cache = ContentCache::with_max_bytes(250);
+        let mtime = SystemTime::now();
+        let content = |n: usize| -> Arc<str> { Arc::from("x".repeat(n).as_str()) };
+
+        let path_a = PathBuf::from("/fake/a.rs");
+        let path_b = PathBuf::from("/fake/b.rs");
+        let path_c = PathBuf::from("/fake/c.rs");
+
+        cache.store(path_a.clone(), mtime, 100, content(100));
+        cache.store(path_b.clone(), mtime, 100, content(100));
+        assert!(cache.get_if_fresh(&path_a, mtime, 100).is_some(), "bump a's recency");
+
+        cache.store(path_c.clone(), mtime, 100, content(100));
+
+        assert!(cache.get_if_fresh(&path_b, mtime, 100).is_none(), "b was least-recently-used and should be evicted");
+        assert!(cache.get_if_fresh(&path_a, mtime, 100).is_some(), "recently-touched a should survive");
+        assert!(cache.get_if_fresh(&path_c, mtime, 100).is_some(), "just-inserted c should survive");
+    }
+
+    #[test]
+    fn content_cache_replacing_an_entry_adjusts_total_bytes_correctly() {
+        // Regression guard for the old_size/new_size delta accounting in
+        // store(): replacing a 500-byte entry with a 10-byte one must shrink
+        // total_bytes by 490, not just add 10 on top of the stale 500.
+        //
+        // Budget is tuned so the two behaviors diverge observably: true
+        // total after replace+one more 480-byte store is 490 (under the
+        // 520 cap — no eviction, both entries survive). A version that
+        // forgets to subtract the old size would compute 990 (over budget),
+        // triggering eviction that empties the cache entirely — caught by
+        // the assertions below.
+        let cache = ContentCache::with_max_bytes(520);
+        let mtime = SystemTime::now();
+        let path_a = PathBuf::from("/fake/a.rs");
+        let path_b = PathBuf::from("/fake/b.rs");
+
+        cache.store(path_a.clone(), mtime, 500, Arc::from("x".repeat(500).as_str()));
+        cache.store(path_a.clone(), mtime, 10, Arc::from("y".repeat(10).as_str()));
+        cache.store(path_b.clone(), mtime, 480, Arc::from("z".repeat(480).as_str()));
+
+        assert!(cache.get_if_fresh(&path_a, mtime, 10).is_some(), "replaced entry should survive under correct accounting");
+        assert!(cache.get_if_fresh(&path_b, mtime, 480).is_some(), "second entry should survive under correct accounting");
     }
 }
