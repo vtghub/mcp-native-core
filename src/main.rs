@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use regex::Regex;
 
 mod cache;
+mod watcher;
 use cache::{DirCache, FileCache};
+use watcher::RepoWatcher;
 
 #[derive(Deserialize, Serialize, Debug)]
 struct JsonRpcRequest {
@@ -52,9 +54,10 @@ impl McpServerState {
 
 pub struct FastSearchTool {
     dir_cache: Arc<DirCache>,
+    watcher: Arc<RepoWatcher>,
 }
 impl FastSearchTool {
-    pub fn new(dir_cache: Arc<DirCache>) -> Self { Self { dir_cache } }
+    pub fn new(dir_cache: Arc<DirCache>, watcher: Arc<RepoWatcher>) -> Self { Self { dir_cache, watcher } }
 }
 
 #[async_trait::async_trait]
@@ -90,7 +93,8 @@ impl McpTool for FastSearchTool {
 
         let regex = Regex::new(query_str).map_err(|e| format!("Invalid Regex Compilation Error: {}", e))?;
         let root_path = PathBuf::from(root_str);
-        
+        self.watcher.ensure_watching(&root_path);
+
         let mut target_files = Vec::new();
         let crawl_stats = self.dir_cache.crawl(&root_path, &extensions, &mut target_files);
 
@@ -147,9 +151,10 @@ impl McpTool for FastSearchTool {
 
 pub struct ParseStructureTool {
     file_cache: Arc<FileCache>,
+    watcher: Arc<RepoWatcher>,
 }
 impl ParseStructureTool {
-    pub fn new(file_cache: Arc<FileCache>) -> Self { Self { file_cache } }
+    pub fn new(file_cache: Arc<FileCache>, watcher: Arc<RepoWatcher>) -> Self { Self { file_cache, watcher } }
 }
 
 #[async_trait::async_trait]
@@ -174,6 +179,10 @@ impl McpTool for ParseStructureTool {
         let path_str = params.get("file_path").and_then(|v| v.as_str()).ok_or("Missing file_path")?;
         let path = PathBuf::from(path_str);
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        if let Some(parent) = path.parent() {
+            self.watcher.ensure_watching(parent);
+        }
 
         let metadata = std::fs::metadata(&path).map_err(|e| format!("Failed to stat file: {}", e))?;
         let mtime = metadata.modified().map_err(|e| format!("Failed to read mtime: {}", e))?;
@@ -228,9 +237,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let dir_cache = Arc::new(DirCache::new());
     let file_cache = Arc::new(FileCache::new());
+    let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone());
 
-    state.register_tool(Box::new(FastSearchTool::new(dir_cache)));
-    state.register_tool(Box::new(ParseStructureTool::new(file_cache)));
+    state.register_tool(Box::new(FastSearchTool::new(dir_cache, watcher.clone())));
+    state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher)));
 
     let shared_state = Arc::new(state);
 

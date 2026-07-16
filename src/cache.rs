@@ -111,6 +111,14 @@ impl DirCache {
         self.entries.insert(dir.to_path_buf(), entry.clone());
         entry
     }
+
+    /// Evict a directory's cached listing, e.g. in response to a filesystem
+    /// watch event. The next crawl through `dir` will re-list it instead of
+    /// trusting a listing that may now be stale. Safe to call for a path with
+    /// no entry (removing a non-existent key is a no-op).
+    pub fn invalidate(&self, dir: &Path) {
+        self.entries.remove(dir);
+    }
 }
 
 struct CachedFileEntry {
@@ -151,6 +159,12 @@ impl FileCache {
             path,
             CachedFileEntry { mtime, len, structural_nodes: nodes },
         );
+    }
+
+    /// Evict a file's cached structural nodes, e.g. in response to a
+    /// filesystem watch event. Safe to call for a path with no entry.
+    pub fn invalidate(&self, path: &Path) {
+        self.entries.remove(path);
     }
 }
 
