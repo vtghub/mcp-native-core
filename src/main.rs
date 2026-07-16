@@ -1,10 +1,13 @@
 use std::sync::Arc;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs::File;
 use tokio::io::{stdin, stdout, BufReader, BufWriter, AsyncBufReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
 use regex::Regex;
+
+mod cache;
+use cache::{DirCache, FileCache};
 
 #[derive(Deserialize, Serialize, Debug)]
 struct JsonRpcRequest {
@@ -47,26 +50,11 @@ impl McpServerState {
     }
 }
 
-pub struct FastSearchTool;
+pub struct FastSearchTool {
+    dir_cache: Arc<DirCache>,
+}
 impl FastSearchTool {
-    pub fn new() -> Self { Self }
-    
-    fn crawl_directory(&self, dir: &Path, extensions: &[String], files: &mut Vec<PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if !path.ends_with(".git") && !path.ends_with("node_modules") && !path.ends_with("target") && !path.ends_with("bin") {
-                        self.crawl_directory(&path, extensions, files);
-                    }
-                } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    if extensions.is_empty() || extensions.iter().any(|e| e == ext) {
-                        files.push(path);
-                    }
-                }
-            }
-        }
-    }
+    pub fn new(dir_cache: Arc<DirCache>) -> Self { Self { dir_cache } }
 }
 
 #[async_trait::async_trait]
@@ -104,7 +92,7 @@ impl McpTool for FastSearchTool {
         let root_path = PathBuf::from(root_str);
         
         let mut target_files = Vec::new();
-        self.crawl_directory(&root_path, &extensions, &mut target_files);
+        let crawl_stats = self.dir_cache.crawl(&root_path, &extensions, &mut target_files);
 
         let start_time = std::time::Instant::now();
         let regex = Arc::new(regex);
@@ -150,14 +138,18 @@ impl McpTool for FastSearchTool {
         Ok(serde_json::json!({
             "status": "success",
             "search_latency_ms": start_time.elapsed().as_millis(),
+            "directories_scanned": crawl_stats.dirs_visited,
+            "directories_rescanned": crawl_stats.dirs_rescanned,
             "matches": final_results
         }))
     }
 }
 
-pub struct ParseStructureTool;
+pub struct ParseStructureTool {
+    file_cache: Arc<FileCache>,
+}
 impl ParseStructureTool {
-    pub fn new() -> Self { Self }
+    pub fn new(file_cache: Arc<FileCache>) -> Self { Self { file_cache } }
 }
 
 #[async_trait::async_trait]
@@ -181,12 +173,26 @@ impl McpTool for ParseStructureTool {
     async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
         let path_str = params.get("file_path").and_then(|v| v.as_str()).ok_or("Missing file_path")?;
         let path = PathBuf::from(path_str);
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+        let metadata = std::fs::metadata(&path).map_err(|e| format!("Failed to stat file: {}", e))?;
+        let mtime = metadata.modified().map_err(|e| format!("Failed to read mtime: {}", e))?;
+        let len = metadata.len();
+
+        if let Some(cached_nodes) = self.file_cache.get_if_fresh(&path, mtime, len) {
+            return Ok(serde_json::json!({
+                "status": "success",
+                "file": path_str,
+                "detected_language": ext,
+                "structural_skeleton": &*cached_nodes,
+                "cache_hit": true
+            }));
+        }
 
         let file = File::open(&path).map_err(|e| format!("Failed to open file: {}", e))?;
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| format!("Mmap failed: {}", e))? };
         let content = std::str::from_utf8(&mmap).map_err(|e| format!("Invalid UTF-8 sequence: {}", e))?;
 
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
         let mut structural_nodes = Vec::new();
 
         for (idx, line) in content.lines().enumerate() {
@@ -203,11 +209,15 @@ impl McpTool for ParseStructureTool {
             }
         }
 
+        let nodes = Arc::new(structural_nodes);
+        self.file_cache.store(path.clone(), mtime, len, nodes.clone());
+
         Ok(serde_json::json!({
             "status": "success",
             "file": path_str,
             "detected_language": ext,
-            "structural_skeleton": structural_nodes
+            "structural_skeleton": &*nodes,
+            "cache_hit": false
         }))
     }
 }
@@ -215,10 +225,13 @@ impl McpTool for ParseStructureTool {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = McpServerState::new();
-    
-    state.register_tool(Box::new(FastSearchTool::new()));
-    state.register_tool(Box::new(ParseStructureTool::new()));
-    
+
+    let dir_cache = Arc::new(DirCache::new());
+    let file_cache = Arc::new(FileCache::new());
+
+    state.register_tool(Box::new(FastSearchTool::new(dir_cache)));
+    state.register_tool(Box::new(ParseStructureTool::new(file_cache)));
+
     let shared_state = Arc::new(state);
 
     let mut reader = BufReader::new(stdin());
