@@ -5,11 +5,14 @@ use std::path::PathBuf;
 use std::fs::File;
 use tokio::io::{stdin, stdout, BufReader, BufWriter, AsyncBufReadExt, AsyncWriteExt};
 use serde::{Deserialize, Serialize};
-use regex::Regex;
 
 mod cache;
+mod extractors;
+mod search_backend;
 mod watcher;
 use cache::{ContentCache, DirCache, FileCache};
+use extractors::{ExtractorRegistry, RegexExtractor};
+use search_backend::{RegexSearchBackend, SearchBackendRegistry};
 use watcher::RepoWatcher;
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -57,10 +60,16 @@ pub struct FastSearchTool {
     dir_cache: Arc<DirCache>,
     content_cache: Arc<ContentCache>,
     watcher: Arc<RepoWatcher>,
+    search_registry: Arc<SearchBackendRegistry>,
 }
 impl FastSearchTool {
-    pub fn new(dir_cache: Arc<DirCache>, content_cache: Arc<ContentCache>, watcher: Arc<RepoWatcher>) -> Self {
-        Self { dir_cache, content_cache, watcher }
+    pub fn new(
+        dir_cache: Arc<DirCache>,
+        content_cache: Arc<ContentCache>,
+        watcher: Arc<RepoWatcher>,
+        search_registry: Arc<SearchBackendRegistry>,
+    ) -> Self {
+        Self { dir_cache, content_cache, watcher, search_registry }
     }
 }
 
@@ -78,7 +87,8 @@ impl McpTool for FastSearchTool {
             "properties": {
                 "root_dir": { "type": "string", "description": "The target codebase absolute directory path" },
                 "query": { "type": "string", "description": "Regex matching pattern string" },
-                "extensions": { "type": "array", "items": { "type": "string" }, "description": "Optional filters, e.g. ['rs', 'cs', 'py']" }
+                "extensions": { "type": "array", "items": { "type": "string" }, "description": "Optional filters, e.g. ['rs', 'cs', 'py']" },
+                "backend": { "type": "string", "description": "Search backend to use, e.g. 'regex' (default)" }
             },
             "required": ["root_dir", "query"]
         })
@@ -87,7 +97,7 @@ impl McpTool for FastSearchTool {
     async fn execute(&self, params: serde_json::Value) -> Result<serde_json::Value, String> {
         let root_str = params.get("root_dir").and_then(|v| v.as_str()).ok_or("Missing root_dir")?;
         let query_str = params.get("query").and_then(|v| v.as_str()).ok_or("Missing query pattern")?;
-        
+
         let mut extensions = Vec::new();
         if let Some(arr) = params.get("extensions").and_then(|v| v.as_array()) {
             for ext in arr {
@@ -95,7 +105,10 @@ impl McpTool for FastSearchTool {
             }
         }
 
-        let regex = Regex::new(query_str).map_err(|e| format!("Invalid Regex Compilation Error: {}", e))?;
+        let backend_name = params.get("backend").and_then(|v| v.as_str()).unwrap_or("regex");
+        let backend = self.search_registry.get(backend_name)
+            .ok_or_else(|| format!("Unknown search backend: {}", backend_name))?;
+        let compiled = backend.compile(query_str)?;
         let root_path = PathBuf::from(root_str);
         self.watcher.ensure_watching(&root_path);
 
@@ -103,13 +116,12 @@ impl McpTool for FastSearchTool {
         let crawl_stats = self.dir_cache.crawl(&root_path, &extensions, &mut target_files);
 
         let start_time = std::time::Instant::now();
-        let regex = Arc::new(regex);
         let mut tasks = Vec::new();
         let content_hits = Arc::new(AtomicUsize::new(0));
         let content_misses = Arc::new(AtomicUsize::new(0));
 
         for file_path in target_files {
-            let pattern = Arc::clone(&regex);
+            let compiled = Arc::clone(&compiled);
             let content_cache = Arc::clone(&self.content_cache);
             let content_hits = Arc::clone(&content_hits);
             let content_misses = Arc::clone(&content_misses);
@@ -143,15 +155,7 @@ impl McpTool for FastSearchTool {
                     Arc::from(std::str::from_utf8(&mmap).ok()?)
                 };
 
-                let mut line_matches = Vec::new();
-                for (idx, line) in content.lines().enumerate() {
-                    if pattern.is_match(line) {
-                        line_matches.push(serde_json::json!({
-                            "line": idx + 1,
-                            "text": line.trim()
-                        }));
-                    }
-                }
+                let line_matches = compiled.find_matches(&content);
 
                 if !line_matches.is_empty() {
                     Some(serde_json::json!({
@@ -187,9 +191,12 @@ impl McpTool for FastSearchTool {
 pub struct ParseStructureTool {
     file_cache: Arc<FileCache>,
     watcher: Arc<RepoWatcher>,
+    registry: Arc<ExtractorRegistry>,
 }
 impl ParseStructureTool {
-    pub fn new(file_cache: Arc<FileCache>, watcher: Arc<RepoWatcher>) -> Self { Self { file_cache, watcher } }
+    pub fn new(file_cache: Arc<FileCache>, watcher: Arc<RepoWatcher>, registry: Arc<ExtractorRegistry>) -> Self {
+        Self { file_cache, watcher, registry }
+    }
 }
 
 #[async_trait::async_trait]
@@ -237,21 +244,10 @@ impl McpTool for ParseStructureTool {
         let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| format!("Mmap failed: {}", e))? };
         let content = std::str::from_utf8(&mmap).map_err(|e| format!("Invalid UTF-8 sequence: {}", e))?;
 
-        let mut structural_nodes = Vec::new();
-
-        for (idx, line) in content.lines().enumerate() {
-            let line_trimmed = line.trim();
-            if line_trimmed.is_empty() || line_trimmed.starts_with("//") || line_trimmed.starts_with("#") {
-                continue;
-            }
-
-            if mcp_native_core::matches_structural_line(ext, line) {
-                structural_nodes.push(serde_json::json!({
-                    "line": idx + 1,
-                    "declaration": line_trimmed
-                }));
-            }
-        }
+        let structural_nodes = match self.registry.get(ext) {
+            Some(extractor) => extractor.extract(ext, content),
+            None => Vec::new(),
+        };
 
         let nodes = Arc::new(structural_nodes);
         self.file_cache.store(path.clone(), mtime, len, nodes.clone());
@@ -275,8 +271,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let content_cache = Arc::new(ContentCache::new());
     let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache.clone());
 
-    state.register_tool(Box::new(FastSearchTool::new(dir_cache, content_cache, watcher.clone())));
-    state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher)));
+    let mut extractor_registry = ExtractorRegistry::new();
+    extractor_registry.register(Arc::new(RegexExtractor));
+    let extractor_registry = Arc::new(extractor_registry);
+
+    let mut search_registry = SearchBackendRegistry::new();
+    search_registry.register(Arc::new(RegexSearchBackend));
+    let search_registry = Arc::new(search_registry);
+
+    state.register_tool(Box::new(FastSearchTool::new(dir_cache, content_cache, watcher.clone(), search_registry)));
+    state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher, extractor_registry)));
 
     let shared_state = Arc::new(state);
 
