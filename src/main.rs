@@ -292,13 +292,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // under concurrent access). Route all responses through a single dedicated
     // writer task instead, so stdout is only ever touched sequentially.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    tokio::spawn(async move {
+    let writer_handle = tokio::spawn(async move {
         let mut writer = BufWriter::new(stdout());
         while let Some(serialized) = rx.recv().await {
             let _ = writer.write_all(format!("{}\n", serialized).as_bytes()).await;
             let _ = writer.flush().await;
         }
     });
+
+    // Tracks in-flight request handlers so we can wait for them to finish
+    // (and their responses to reach the writer) before exiting on EOF,
+    // instead of dropping the runtime mid-flight and losing pending output.
+    let mut request_tasks = tokio::task::JoinSet::new();
 
     while reader.read_line(&mut line).await? > 0 {
         let current_line = line.trim().to_string();
@@ -309,7 +314,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let state_clone = Arc::clone(&shared_state);
         let tx_clone = tx.clone();
 
-        tokio::spawn(async move {
+        request_tasks.spawn(async move {
             if let Ok(req) = serde_json::from_str::<JsonRpcRequest>(&current_line) {
                 // MCP sends background notifications (like "notifications/initialized").
                 // We should safely ignore requests with no ID to prevent crashing.
@@ -328,6 +333,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
     }
+
+    // Stdin hit EOF. Let every request that was already in flight finish
+    // and send its response before we tear anything down.
+    while request_tasks.join_next().await.is_some() {}
+
+    // Drop the last sender so the writer's channel closes and it flushes
+    // any responses still queued, then wait for it to actually finish
+    // writing before the process exits.
+    drop(tx);
+    let _ = writer_handle.await;
+
     Ok(())
 }
 
