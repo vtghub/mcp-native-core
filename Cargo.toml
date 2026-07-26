@@ -3,6 +3,14 @@ name = "mcp-native-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Local embedding-based `semantic_search`, on by default. Pulls in candle
+# (an ML runtime) plus a downloaded/cached model — real memory and binary-size
+# cost that clients who only need fast_search/parse_structure can opt out of
+# with `cargo build --release --no-default-features`.
+default = ["semantic-search"]
+semantic-search = ["dep:candle-core", "dep:candle-nn", "dep:candle-transformers", "dep:hf-hub", "dep:tokenizers", "dep:rand"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -12,3 +20,12 @@ async-trait = "0.1"
 memmap2 = "0.9"
 dashmap = "6"
 notify = "6"
+candle-core = { version = "0.11.0", optional = true }
+candle-nn = { version = "0.11.0", optional = true }
+candle-transformers = { version = "0.11.0", optional = true }
+hf-hub = { version = "1.0.0", optional = true }
+tokenizers = { version = "0.23.1", optional = true }
+rand = { version = "0.10.2", optional = true }
+
+[dev-dependencies]
+ahash = "0.8.12"
