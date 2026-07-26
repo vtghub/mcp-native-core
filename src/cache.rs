@@ -733,12 +733,13 @@ mod tests {
                 vector: crate::quantizer::QuantizedVector::encode(&[0.1, 0.2, 0.3, 0.4], &rotation),
             }])
         };
-        // Each entry is one 4-dim QuantizedVector: 4 (u8 data) + 8 (min +
-        // scale, as f32s) + 16 (line-range usizes) = 28 bytes. A 70-byte
-        // budget (90%-of-budget eviction target: 63) fits two comfortably
-        // (56) but not three (84) — and evicting just the single
-        // least-recently-used entry is enough to land back under target.
-        let cache = VectorCache::with_max_bytes(70);
+        // Each entry is one 4-dim QuantizedVector: 4 (u8 data) + 4
+        // (length-renormalization correction, an f32) + 16 (line-range
+        // usizes) = 24 bytes. A 60-byte budget (90%-of-budget eviction
+        // target: 54) fits two comfortably (48) but not three (72) — and
+        // evicting just the single least-recently-used entry is enough to
+        // land back under target.
+        let cache = VectorCache::with_max_bytes(60);
         let mtime = SystemTime::now();
 
         let path_a = PathBuf::from("/fake/a.rs");

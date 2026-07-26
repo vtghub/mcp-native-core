@@ -1867,6 +1867,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "statrs",
  "tokenizers 0.23.1",
  "tokio",
 ]
