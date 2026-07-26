@@ -7,12 +7,16 @@ use tokio::io::{stdin, stdout, BufReader, BufWriter, AsyncBufReadExt, AsyncWrite
 use serde::{Deserialize, Serialize};
 
 mod cache;
+mod embeddings;
 mod extractors;
+mod quantizer;
 mod search_backend;
+mod semantic_search;
 mod watcher;
-use cache::{ContentCache, DirCache, FileCache};
+use cache::{ContentCache, DirCache, FileCache, VectorCache};
 use extractors::{ExtractorRegistry, RegexExtractor};
 use search_backend::{RegexSearchBackend, SearchBackendRegistry};
+use semantic_search::SemanticSearchTool;
 use watcher::RepoWatcher;
 
 #[derive(Deserialize, Serialize, Debug)]
@@ -269,7 +273,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dir_cache = Arc::new(DirCache::new());
     let file_cache = Arc::new(FileCache::new());
     let content_cache = Arc::new(ContentCache::new());
-    let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache.clone());
+    let vector_cache = Arc::new(VectorCache::new());
+    let watcher = RepoWatcher::spawn(dir_cache.clone(), file_cache.clone(), content_cache.clone(), vector_cache.clone());
 
     let mut extractor_registry = ExtractorRegistry::new();
     extractor_registry.register(Arc::new(RegexExtractor));
@@ -279,8 +284,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     search_registry.register(Arc::new(RegexSearchBackend));
     let search_registry = Arc::new(search_registry);
 
-    state.register_tool(Box::new(FastSearchTool::new(dir_cache, content_cache, watcher.clone(), search_registry)));
-    state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher, extractor_registry)));
+    state.register_tool(Box::new(FastSearchTool::new(
+        dir_cache.clone(),
+        content_cache.clone(),
+        watcher.clone(),
+        search_registry,
+    )));
+    state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher.clone(), extractor_registry)));
+    state.register_tool(Box::new(SemanticSearchTool::new(dir_cache, content_cache, vector_cache, watcher)));
 
     let shared_state = Arc::new(state);
 

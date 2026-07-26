@@ -4,6 +4,8 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::quantizer::QuantizedVector;
+
 const SKIPPED_DIR_NAMES: [&str; 4] = [".git", "node_modules", "target", "bin"];
 
 #[derive(Clone)]
@@ -166,6 +168,140 @@ impl FileCache {
     /// filesystem watch event. Safe to call for a path with no entry.
     pub fn invalidate(&self, path: &Path) {
         self.entries.remove(path);
+    }
+}
+
+/// One `semantic_search` chunk: a file's `[start_line, end_line]` window
+/// (1-based, inclusive) plus its quantized embedding.
+#[derive(Clone)]
+pub struct EmbeddedChunk {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub vector: QuantizedVector,
+}
+
+impl EmbeddedChunk {
+    fn byte_size(&self) -> usize {
+        self.vector.byte_size() + std::mem::size_of::<usize>() * 2
+    }
+}
+
+// 128 MiB by default; override with MCP_VECTOR_CACHE_MAX_BYTES. Smaller than
+// ContentCache's default since a QuantizedVector is already ~4x smaller than
+// the f32 embedding it was built from — the point of quantizing in the first
+// place is to hold far more of a repo's embeddings in the same budget.
+const DEFAULT_VECTOR_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+fn env_vector_cache_max_bytes() -> usize {
+    std::env::var("MCP_VECTOR_CACHE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_VECTOR_CACHE_MAX_BYTES)
+}
+
+struct CachedVectorEntry {
+    mtime: SystemTime,
+    len: u64,
+    chunks: Arc<Vec<EmbeddedChunk>>,
+    bytes: usize,
+    last_used: AtomicU64,
+}
+
+/// Caches a file's quantized chunk embeddings for `semantic_search`, keyed
+/// by absolute path with the same (mtime, len) freshness contract as
+/// `FileCache`. Storing `QuantizedVector`s rather than raw `f32` embeddings
+/// keeps this index's memory footprint a fraction of what full-precision
+/// vectors for a whole repo would cost — and bounding it with the same
+/// byte-budget LRU eviction as `ContentCache` (see that struct's docs for
+/// the eviction algorithm and its trade-offs, which apply identically here)
+/// means that saving compounds instead of just delaying an unbounded grow.
+pub struct VectorCache {
+    entries: DashMap<PathBuf, CachedVectorEntry>,
+    total_bytes: AtomicUsize,
+    max_bytes: usize,
+    clock: AtomicU64,
+}
+
+impl VectorCache {
+    pub fn new() -> Self {
+        Self::with_max_bytes(env_vector_cache_max_bytes())
+    }
+
+    /// Construct with an explicit byte budget instead of the environment
+    /// default — mainly for tests that need eviction to trigger
+    /// deterministically without indexing hundreds of megabytes of chunks.
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self { entries: DashMap::new(), total_bytes: AtomicUsize::new(0), max_bytes, clock: AtomicU64::new(0) }
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.fetch_add(1, Ordering::Relaxed)
+    }
+
+    pub fn get_if_fresh(&self, path: &Path, mtime: SystemTime, len: u64) -> Option<Arc<Vec<EmbeddedChunk>>> {
+        let tick = self.tick();
+        self.entries.get(path).and_then(|entry| {
+            if entry.mtime == mtime && entry.len == len {
+                entry.last_used.store(tick, Ordering::Relaxed);
+                Some(entry.chunks.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn store(&self, path: PathBuf, mtime: SystemTime, len: u64, chunks: Arc<Vec<EmbeddedChunk>>) {
+        let new_size: usize = chunks.iter().map(EmbeddedChunk::byte_size).sum();
+        let entry = CachedVectorEntry { mtime, len, chunks, bytes: new_size, last_used: AtomicU64::new(self.tick()) };
+        let old = self.entries.insert(path, entry);
+        let old_size = old.map(|e| e.bytes).unwrap_or(0);
+        if new_size >= old_size {
+            self.total_bytes.fetch_add(new_size - old_size, Ordering::Relaxed);
+        } else {
+            self.total_bytes.fetch_sub(old_size - new_size, Ordering::Relaxed);
+        }
+
+        if self.total_bytes.load(Ordering::Relaxed) > self.max_bytes {
+            self.evict_to_target();
+        }
+    }
+
+    /// Evict least-recently-used entries until the cache is back under
+    /// `EVICT_TARGET_RATIO * max_bytes` — same snapshot-sort-evict approach
+    /// as `ContentCache::evict_to_target`.
+    fn evict_to_target(&self) {
+        let target = (self.max_bytes as f64 * EVICT_TARGET_RATIO) as usize;
+
+        let mut snapshot: Vec<(PathBuf, u64, usize)> = self
+            .entries
+            .iter()
+            .map(|e| (e.key().clone(), e.value().last_used.load(Ordering::Relaxed), e.value().bytes))
+            .collect();
+        snapshot.sort_unstable_by_key(|&(_, last_used, _)| last_used);
+
+        let mut current = self.total_bytes.load(Ordering::Relaxed);
+        let mut freed = 0usize;
+        for (path, _, size) in snapshot {
+            if current <= target {
+                break;
+            }
+            if self.entries.remove(&path).is_some() {
+                current = current.saturating_sub(size);
+                freed += size;
+            }
+        }
+        if freed > 0 {
+            self.total_bytes.fetch_sub(freed, Ordering::Relaxed);
+        }
+    }
+
+    /// Evict a file's cached chunk embeddings, e.g. in response to a
+    /// filesystem watch event. Safe to call for a path with no entry.
+    pub fn invalidate(&self, path: &Path) {
+        if let Some((_, entry)) = self.entries.remove(path) {
+            self.total_bytes.fetch_sub(entry.bytes, Ordering::Relaxed);
+        }
     }
 }
 
@@ -502,6 +638,90 @@ mod tests {
         assert!(cache.get_if_fresh(&path_b, mtime, 100).is_none(), "b was least-recently-used and should be evicted");
         assert!(cache.get_if_fresh(&path_a, mtime, 100).is_some(), "recently-touched a should survive");
         assert!(cache.get_if_fresh(&path_c, mtime, 100).is_some(), "just-inserted c should survive");
+    }
+
+    #[test]
+    fn vector_cache_serves_fresh_entry_and_rejects_stale() {
+        let dir = TempDir::new();
+        let file_path = dir.path().join("a.rs");
+        fs::write(&file_path, "fn a() {}").unwrap();
+
+        let meta = fs::metadata(&file_path).unwrap();
+        let (mtime, len) = (meta.modified().unwrap(), meta.len());
+
+        let cache = VectorCache::new();
+        assert!(cache.get_if_fresh(&file_path, mtime, len).is_none());
+
+        let rotation = crate::quantizer::Rotation::new(4);
+        let chunks = Arc::new(vec![EmbeddedChunk {
+            start_line: 1,
+            end_line: 1,
+            vector: crate::quantizer::QuantizedVector::encode(&[0.5, 0.5, 0.5, 0.5], &rotation),
+        }]);
+        cache.store(file_path.clone(), mtime, len, chunks);
+
+        let hit = cache.get_if_fresh(&file_path, mtime, len);
+        assert!(hit.is_some());
+        assert_eq!(hit.unwrap().len(), 1);
+
+        settle();
+        fs::write(&file_path, "fn a() {}\nfn b() {}").unwrap();
+        let new_meta = fs::metadata(&file_path).unwrap();
+
+        let stale = cache.get_if_fresh(&file_path, new_meta.modified().unwrap(), new_meta.len());
+        assert!(stale.is_none(), "changed file should invalidate cache");
+    }
+
+    #[test]
+    fn vector_cache_invalidate_removes_entry() {
+        let rotation = crate::quantizer::Rotation::new(4);
+        let path = PathBuf::from("/fake/a.rs");
+        let mtime = SystemTime::now();
+        let chunks = Arc::new(vec![EmbeddedChunk {
+            start_line: 1,
+            end_line: 1,
+            vector: crate::quantizer::QuantizedVector::encode(&[0.5, 0.5, 0.5, 0.5], &rotation),
+        }]);
+
+        let cache = VectorCache::new();
+        cache.store(path.clone(), mtime, 9, chunks);
+        assert!(cache.get_if_fresh(&path, mtime, 9).is_some());
+
+        cache.invalidate(&path);
+        assert!(cache.get_if_fresh(&path, mtime, 9).is_none());
+    }
+
+    #[test]
+    fn vector_cache_evicts_least_recently_used_when_over_budget() {
+        let rotation = crate::quantizer::Rotation::new(4);
+        let one_chunk = || {
+            Arc::new(vec![EmbeddedChunk {
+                start_line: 1,
+                end_line: 1,
+                vector: crate::quantizer::QuantizedVector::encode(&[0.1, 0.2, 0.3, 0.4], &rotation),
+            }])
+        };
+        // Each entry is one 4-dim QuantizedVector: 4 (u8 data) + 8 (min +
+        // scale, as f32s) + 16 (line-range usizes) = 28 bytes. A 70-byte
+        // budget (90%-of-budget eviction target: 63) fits two comfortably
+        // (56) but not three (84) — and evicting just the single
+        // least-recently-used entry is enough to land back under target.
+        let cache = VectorCache::with_max_bytes(70);
+        let mtime = SystemTime::now();
+
+        let path_a = PathBuf::from("/fake/a.rs");
+        let path_b = PathBuf::from("/fake/b.rs");
+        let path_c = PathBuf::from("/fake/c.rs");
+
+        cache.store(path_a.clone(), mtime, 1, one_chunk());
+        cache.store(path_b.clone(), mtime, 1, one_chunk());
+        assert!(cache.get_if_fresh(&path_a, mtime, 1).is_some(), "bump a's recency");
+
+        cache.store(path_c.clone(), mtime, 1, one_chunk());
+
+        assert!(cache.get_if_fresh(&path_b, mtime, 1).is_none(), "b was least-recently-used and should be evicted");
+        assert!(cache.get_if_fresh(&path_a, mtime, 1).is_some(), "recently-touched a should survive");
+        assert!(cache.get_if_fresh(&path_c, mtime, 1).is_some(), "just-inserted c should survive");
     }
 
     #[test]

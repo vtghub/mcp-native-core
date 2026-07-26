@@ -12,3 +12,12 @@ async-trait = "0.1"
 memmap2 = "0.9"
 dashmap = "6"
 notify = "6"
+candle-core = "0.11.0"
+candle-nn = "0.11.0"
+candle-transformers = "0.11.0"
+hf-hub = "1.0.0"
+tokenizers = "0.23.1"
+rand = "0.10.2"
+
+[dev-dependencies]
+ahash = "0.8.12"
