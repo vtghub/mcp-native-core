@@ -33,3 +33,17 @@ Standard MCP file-system servers rely on traditional buffered file reading and t
 Ensure you have Rust installed (`rustup`), then compile for release:
 ```bash
 cargo build --release
+```
+This produces `target/release/mcp-native-core`. For a smaller, dependency-light build without `semantic_search` (see above), add `--no-default-features`.
+
+### 2. Register it with your MCP client
+`mcp-native-core` speaks newline-delimited JSON-RPC 2.0 over stdio, like any other MCP stdio server. Point your client at the compiled binary — for example, in Claude Code's `.mcp.json`:
+```json
+{
+  "mcpServers": {
+    "native-core": {
+      "command": "/path/to/mcp-native-core/target/release/mcp-native-core"
+    }
+  }
+}
+```
