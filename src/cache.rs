@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+#[cfg(feature = "semantic-search")]
 use crate::quantizer::QuantizedVector;
 
 const SKIPPED_DIR_NAMES: [&str; 4] = [".git", "node_modules", "target", "bin"];
@@ -173,6 +174,7 @@ impl FileCache {
 
 /// One `semantic_search` chunk: a file's `[start_line, end_line]` window
 /// (1-based, inclusive) plus its quantized embedding.
+#[cfg(feature = "semantic-search")]
 #[derive(Clone)]
 pub struct EmbeddedChunk {
     pub start_line: usize,
@@ -180,6 +182,7 @@ pub struct EmbeddedChunk {
     pub vector: QuantizedVector,
 }
 
+#[cfg(feature = "semantic-search")]
 impl EmbeddedChunk {
     fn byte_size(&self) -> usize {
         self.vector.byte_size() + std::mem::size_of::<usize>() * 2
@@ -190,8 +193,10 @@ impl EmbeddedChunk {
 // ContentCache's default since a QuantizedVector is already ~4x smaller than
 // the f32 embedding it was built from — the point of quantizing in the first
 // place is to hold far more of a repo's embeddings in the same budget.
+#[cfg(feature = "semantic-search")]
 const DEFAULT_VECTOR_CACHE_MAX_BYTES: usize = 128 * 1024 * 1024;
 
+#[cfg(feature = "semantic-search")]
 fn env_vector_cache_max_bytes() -> usize {
     std::env::var("MCP_VECTOR_CACHE_MAX_BYTES")
         .ok()
@@ -200,6 +205,7 @@ fn env_vector_cache_max_bytes() -> usize {
         .unwrap_or(DEFAULT_VECTOR_CACHE_MAX_BYTES)
 }
 
+#[cfg(feature = "semantic-search")]
 struct CachedVectorEntry {
     mtime: SystemTime,
     len: u64,
@@ -216,6 +222,12 @@ struct CachedVectorEntry {
 /// byte-budget LRU eviction as `ContentCache` (see that struct's docs for
 /// the eviction algorithm and its trade-offs, which apply identically here)
 /// means that saving compounds instead of just delaying an unbounded grow.
+///
+/// Behind the `semantic-search` feature (on by default): when that feature
+/// is off, a zero-field stand-in below provides the same `new()`/
+/// `invalidate()` surface `RepoWatcher` needs, so watcher wiring doesn't
+/// have to change based on the feature at all.
+#[cfg(feature = "semantic-search")]
 pub struct VectorCache {
     entries: DashMap<PathBuf, CachedVectorEntry>,
     total_bytes: AtomicUsize,
@@ -223,6 +235,7 @@ pub struct VectorCache {
     clock: AtomicU64,
 }
 
+#[cfg(feature = "semantic-search")]
 impl VectorCache {
     pub fn new() -> Self {
         Self::with_max_bytes(env_vector_cache_max_bytes())
@@ -303,6 +316,22 @@ impl VectorCache {
             self.total_bytes.fetch_sub(entry.bytes, Ordering::Relaxed);
         }
     }
+}
+
+/// Stand-in for `VectorCache` when the `semantic-search` feature is
+/// disabled: there's no embedding index to maintain, so this holds nothing
+/// and every operation is a no-op — it exists purely so `RepoWatcher` and
+/// `main.rs` don't need feature-conditional code of their own.
+#[cfg(not(feature = "semantic-search"))]
+pub struct VectorCache;
+
+#[cfg(not(feature = "semantic-search"))]
+impl VectorCache {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn invalidate(&self, _path: &Path) {}
 }
 
 // 256 MiB by default; override with MCP_CONTENT_CACHE_MAX_BYTES (parsed once
@@ -641,6 +670,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic-search")]
     fn vector_cache_serves_fresh_entry_and_rejects_stale() {
         let dir = TempDir::new();
         let file_path = dir.path().join("a.rs");
@@ -673,6 +703,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic-search")]
     fn vector_cache_invalidate_removes_entry() {
         let rotation = crate::quantizer::Rotation::new(4);
         let path = PathBuf::from("/fake/a.rs");
@@ -692,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "semantic-search")]
     fn vector_cache_evicts_least_recently_used_when_over_budget() {
         let rotation = crate::quantizer::Rotation::new(4);
         let one_chunk = || {

@@ -266,6 +266,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "semantic-search")]
     async fn watcher_evicts_vector_cache_entry_on_modify() {
         let dir = TempDir::new();
         let file_path = dir.0.join("a.rs");

@@ -21,6 +21,12 @@ Standard MCP file-system servers rely on traditional buffered file reading and t
   * `MCP_EMBEDDING_MODEL_ID` — a different Hugging Face model id to download (default `sentence-transformers/all-MiniLM-L6-v2`).
   * `MCP_VECTOR_CACHE_MAX_BYTES` — byte budget for the in-memory embedding index (default 128 MiB, LRU-evicted like the other caches).
 
+  `semantic_search` sits behind the `semantic-search` Cargo feature (**on by default**). It's the one part of this project that isn't a lightweight, dependency-free binary — it pulls in `candle` plus a downloaded model, at real cost to build time and binary size (~22 MiB vs. ~4 MiB stripped of it). Clients who only need `fast_search`/`parse_structure` and want the smaller footprint can opt out at build time:
+  ```bash
+  cargo build --release --no-default-features
+  ```
+  With the feature off, `semantic_search` is simply absent from `tools/list` — the other two tools are unaffected either way.
+
 ## ⚙️ Installation & Usage
 
 ### 1. Build the binary

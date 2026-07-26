@@ -7,15 +7,19 @@ use tokio::io::{stdin, stdout, BufReader, BufWriter, AsyncBufReadExt, AsyncWrite
 use serde::{Deserialize, Serialize};
 
 mod cache;
+#[cfg(feature = "semantic-search")]
 mod embeddings;
 mod extractors;
+#[cfg(feature = "semantic-search")]
 mod quantizer;
 mod search_backend;
+#[cfg(feature = "semantic-search")]
 mod semantic_search;
 mod watcher;
 use cache::{ContentCache, DirCache, FileCache, VectorCache};
 use extractors::{ExtractorRegistry, RegexExtractor};
 use search_backend::{RegexSearchBackend, SearchBackendRegistry};
+#[cfg(feature = "semantic-search")]
 use semantic_search::SemanticSearchTool;
 use watcher::RepoWatcher;
 
@@ -291,6 +295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         search_registry,
     )));
     state.register_tool(Box::new(ParseStructureTool::new(file_cache, watcher.clone(), extractor_registry)));
+    #[cfg(feature = "semantic-search")]
     state.register_tool(Box::new(SemanticSearchTool::new(dir_cache, content_cache, vector_cache, watcher)));
 
     let shared_state = Arc::new(state);
